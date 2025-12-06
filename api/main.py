@@ -1,68 +1,180 @@
 import os
-import streamlit as st
 import pickle
-import time
-from langchain import OpenAI
-from langchain.chains import RetrievalQAWithSourcesChain
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.document_loaders import UnstructuredURLLoader
-from langchain.embeddings import OpenAIEmbeddings
-from langchain.vectorstores import FAISS
-
+from typing import List, Optional
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, HttpUrl
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import UnstructuredURLLoader
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
 from dotenv import load_dotenv
-load_dotenv()  # take environment variables from .env (especially openai api key)
 
-st.title("RockyBot: News Research Tool 📈")
-st.sidebar.title("News Article URLs")
+load_dotenv()
 
-urls = []
-for i in range(3):
-    url = st.sidebar.text_input(f"URL {i+1}")
-    urls.append(url)
+app = FastAPI(title="StockBot API", version="1.0.0")
 
-process_url_clicked = st.sidebar.button("Process URLs")
-file_path = "faiss_store_openai.pkl"
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://localhost:5173"],  # React dev servers
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-main_placeholder = st.empty()
-llm = OpenAI(temperature=0.9, max_tokens=500)
+# Initialize LLM
+llm = ChatGoogleGenerativeAI(
+    model="gemini-2.0-flash",
+    api_key=os.getenv("GOOGLE_API_KEY")
+)
 
-if process_url_clicked:
-    # load data
-    loader = UnstructuredURLLoader(urls=urls)
-    main_placeholder.text("Data Loading...Started...✅✅✅")
-    data = loader.load()
-    # split data
-    text_splitter = RecursiveCharacterTextSplitter(
-        separators=['\n\n', '\n', '.', ','],
-        chunk_size=1000
-    )
-    main_placeholder.text("Text Splitter...Started...✅✅✅")
-    docs = text_splitter.split_documents(data)
-    # create embeddings and save it to FAISS index
-    embeddings = OpenAIEmbeddings()
-    vectorstore_openai = FAISS.from_documents(docs, embeddings)
-    main_placeholder.text("Embedding Vector Started Building...✅✅✅")
-    time.sleep(2)
+# File path for FAISS storage
+FAISS_STORE_PATH = "faiss_store.pkl"
 
-    # Save the FAISS index to a pickle file
-    with open(file_path, "wb") as f:
-        pickle.dump(vectorstore_openai, f)
 
-query = main_placeholder.text_input("Question: ")
-if query:
-    if os.path.exists(file_path):
-        with open(file_path, "rb") as f:
+# Pydantic models
+class URLRequest(BaseModel):
+    urls: List[HttpUrl]
+
+
+class QuestionRequest(BaseModel):
+    question: str
+
+
+class ProcessResponse(BaseModel):
+    status: str
+    message: str
+    urls_processed: int
+
+
+class AnswerResponse(BaseModel):
+    answer: str
+    sources: List[str]
+
+
+@app.get("/")
+async def root():
+    """Root endpoint"""
+    return {
+        "message": "StockBot API is running",
+        "version": "1.0.0",
+        "endpoints": {
+            "POST /process-urls": "Process news article URLs",
+            "POST /ask": "Ask questions about processed articles",
+            "GET /health": "Health check"
+        }
+    }
+
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {"status": "healthy"}
+
+
+@app.post("/process-urls", response_model=ProcessResponse)
+async def process_urls(request: URLRequest):
+    """
+    Process news article URLs and create embeddings
+    """
+    try:
+        # Convert HttpUrl objects to strings
+        urls = [str(url) for url in request.urls]
+        
+        if not urls or all(url == "" for url in urls):
+            raise HTTPException(status_code=400, detail="No valid URLs provided")
+        
+        # Filter out empty URLs
+        valid_urls = [url for url in urls if url.strip()]
+        
+        # Load data from URLs
+        loader = UnstructuredURLLoader(urls=valid_urls)
+        data = loader.load()
+        
+        # Split text into chunks
+        text_splitter = RecursiveCharacterTextSplitter(
+            separators=['\n\n', '\n', '.', ','],
+            chunk_size=1000
+        )
+        docs = text_splitter.split_documents(data)
+        
+        # Create embeddings
+        embeddings = HuggingFaceEmbeddings(
+            model_name="sentence-transformers/all-MiniLM-L6-v2",
+            model_kwargs={'device': 'cpu'},
+            encode_kwargs={'normalize_embeddings': True}
+        )
+        
+        # Create FAISS vector store
+        vectorstore = FAISS.from_documents(docs, embeddings)
+        
+        # Save to pickle file
+        with open(FAISS_STORE_PATH, "wb") as f:
+            pickle.dump(vectorstore, f)
+        
+        return ProcessResponse(
+            status="success",
+            message="URLs processed successfully",
+            urls_processed=len(valid_urls)
+        )
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error processing URLs: {str(e)}")
+
+
+@app.post("/ask", response_model=AnswerResponse)
+async def ask_question(request: QuestionRequest):
+    """
+    Ask a question about the processed articles
+    """
+    try:
+        if not os.path.exists(FAISS_STORE_PATH):
+            raise HTTPException(
+                status_code=400,
+                detail="No processed data found. Please process URLs first."
+            )
+        
+        # Load the vector store
+        with open(FAISS_STORE_PATH, "rb") as f:
             vectorstore = pickle.load(f)
-            chain = RetrievalQAWithSourcesChain.from_llm(llm=llm, retriever=vectorstore.as_retriever())
-            result = chain({"question": query}, return_only_outputs=True)
-            # result will be a dictionary of this format --> {"answer": "", "sources": [] }
-            st.header("Answer")
-            st.write(result["answer"])
+        
+        # Retrieve relevant documents
+        retriever = vectorstore.as_retriever()
+        docs = retriever.invoke(request.question)
+        
+        # Prepare context from retrieved documents
+        context = "\n\n".join([doc.page_content for doc in docs])
+        sources = list(set([
+            doc.metadata.get('source', '')
+            for doc in docs
+            if doc.metadata.get('source')
+        ]))
+        
+        # Create prompt and get answer from LLM
+        prompt = f"""Based on the following context, answer the question.
+        
+Context:
+{context}
 
-            # Display sources, if available
-            sources = result.get("sources", "")
-            if sources:
-                st.subheader("Sources:")
-                sources_list = sources.split("\n")  # Split the sources by newline
-                for source in sources_list:
-                    st.write(source)
+Question: {request.question}
+
+Answer:"""
+        
+        answer = llm.invoke(prompt)
+        
+        return AnswerResponse(
+            answer=answer.content,
+            sources=sources
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error answering question: {str(e)}")
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
